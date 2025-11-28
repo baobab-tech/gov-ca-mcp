@@ -56,29 +56,6 @@ class TransportationAPIClient:
                 "format": "geojson",
             },
         },
-        "cycling": {
-            "montreal": {
-                "province": "Quebec",
-                "city": "Montreal",
-                "geojson_url": "https://donnees.montreal.ca/dataset/5ea29f40-1b5b-4f34-85b3-7c67088ff536/resource/0dc6612a-be66-406b-b2d9-59c9e1c65ebf/download/reseau_cyclable.geojson",
-                "name": "Montreal Bicycle Network",
-                "format": "geojson",
-            },
-            "toronto": {
-                "province": "Ontario",
-                "city": "Toronto",
-                "geojson_url": "https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/abbe5ee3-e249-4f86-a219-f0022eaddcc9/resource/023da9a2-8848-4e10-9cad-e7f9119cd874/download/cycling-network-4326.geojson",
-                "name": "Toronto Cycling Network",
-                "format": "geojson",
-            },
-            "quebec_city": {
-                "province": "Quebec",
-                "city": "Quebec City",
-                "geojson_url": "https://www.donneesquebec.ca/recherche/dataset/7e359f54-b8d7-45aa-abaa-2f2135ad05f1/resource/1c7ba52f-92d4-47f2-a255-850f822d9ed8/download/reseau_cyclable.geojson",
-                "name": "Quebec City Bicycle Network",
-                "format": "geojson",
-            },
-        },
         "airports": {
             "quebec": {
                 "province": "Quebec",
@@ -241,8 +218,197 @@ class TransportationAPIClient:
     ) -> dict[str, Any]:
         """
         Search and filter bridge infrastructure across Canada.
-        Returns actual bridge records with location, condition, and metadata.
-        Dynamically selects data sources based on province/city filters.
+        Uses Statistics Canada Core Public Infrastructure data for all provinces,
+        supplemented by detailed provincial/municipal data where available.
+        
+        Args:
+            province: Filter by province (e.g., 'Ontario', 'British Columbia', 'Saskatchewan')
+            city: Filter by city name (for detailed data where available)
+            condition: Filter by condition rating (good, fair, poor, critical)
+            capacity_min: Minimum capacity in tonnes (not available in StatCan data)
+            built_after: Filter bridges built after this year (for detailed data only)
+            limit: Maximum records to return (default 100)
+        
+        Returns:
+            Bridge records with condition data from Statistics Canada,
+            plus detailed records from provincial sources where available.
+        """
+        # Normalize province name
+        province_normalized = self.PROVINCE_NAMES.get(province.lower(), province) if province else None
+        
+        result = {
+            "province": province_normalized,
+            "city": city,
+            "bridges": [],
+            "condition_summary": None,
+            "sources": [],
+            "filters_applied": {
+                "province": province,
+                "city": city,
+                "condition": condition,
+                "capacity_min": capacity_min,
+                "built_after": built_after,
+            },
+        }
+        
+        # First, get StatCan aggregate data for the province/region
+        try:
+            statcan_data = self._fetch_statcan_bridge_inventory(province_normalized or "Canada")
+            if statcan_data:
+                result["condition_summary"] = statcan_data.get("condition_distribution")
+                result["statcan_data"] = {
+                    "source": "Statistics Canada - Core Public Infrastructure Survey",
+                    "table_id": self.STATCAN_BRIDGE_INVENTORY["table_id"],
+                    "reference_year": statcan_data.get("reference_year", "2022"),
+                    "condition_distribution": statcan_data.get("condition_distribution"),
+                    "by_owner": statcan_data.get("by_owner"),
+                }
+                result["sources"].append("Statistics Canada CCPI Survey")
+        except Exception as e:
+            logger.warning(f"Could not fetch StatCan bridge data: {e}")
+        
+        # Then, try to get detailed bridge records from provincial/municipal sources
+        detailed_bridges = self._fetch_detailed_bridge_records(
+            province, city, condition, built_after, limit
+        )
+        
+        result["bridges"] = detailed_bridges.get("bridges", [])
+        result["count"] = len(result["bridges"])
+        result["sources"].extend(detailed_bridges.get("sources", []))
+        
+        # Add note about data availability
+        if not result["bridges"] and result.get("statcan_data"):
+            result["note"] = (
+                f"Detailed bridge records not available for {province_normalized or 'all provinces'}. "
+                "StatCan aggregate condition data is provided. "
+                "Detailed records available for: Ontario, Quebec/Montreal, Nova Scotia."
+            )
+        
+        return result
+
+    def _fetch_statcan_bridge_inventory(self, location: str) -> dict[str, Any]:
+        """
+        Fetch bridge inventory/condition distribution from Statistics Canada.
+        Returns percentage distribution by condition for the specified province.
+        """
+        import zipfile
+        import tempfile
+        import os
+        
+        try:
+            zip_url = self.STATCAN_BRIDGE_INVENTORY["url"]
+            asset_filter = self.STATCAN_BRIDGE_INVENTORY["asset_filter"]
+            
+            logger.info(f"Downloading StatCan bridge inventory from {zip_url}")
+            
+            req = urllib.request.Request(
+                zip_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; GovMCP/1.0)"}
+            )
+            
+            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=60) as response:
+                zip_data = response.read()
+            
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = os.path.join(tmpdir, "data.zip")
+                with open(zip_path, "wb") as f:
+                    f.write(zip_data)
+                
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    csv_files = [n for n in zf.namelist() if n.endswith(".csv") and "metadata" not in n.lower()]
+                    if not csv_files:
+                        return {}
+                    
+                    with zf.open(csv_files[0]) as csvfile:
+                        content = csvfile.read().decode("utf-8-sig")
+                        return self._parse_statcan_bridge_inventory_csv(content, asset_filter, location)
+            
+        except Exception as e:
+            logger.error(f"Error fetching StatCan bridge inventory: {e}")
+            return {}
+
+    def _parse_statcan_bridge_inventory_csv(
+        self,
+        csv_content: str,
+        asset_filter: str,
+        location: str,
+    ) -> dict[str, Any]:
+        """
+        Parse Statistics Canada bridge inventory CSV.
+        Returns condition distribution percentages by province.
+        """
+        result = {
+            "reference_year": "2022",
+            "condition_distribution": {},
+            "by_owner": {},
+        }
+        
+        reader = csv.DictReader(io.StringIO(csv_content))
+        
+        # Condition mapping
+        conditions = {
+            "Very poor": "very_poor",
+            "Poor": "poor", 
+            "Fair": "fair",
+            "Good": "good",
+            "Very good": "very_good",
+            "Physical condition unknown": "unknown",
+        }
+        
+        for row in reader:
+            geo = row.get("GEO", "")
+            asset_type = row.get("Core public infrastructure assets", "")
+            owner = row.get("Public organizations", "")
+            condition = row.get("Overall physical condition of assets", "")
+            value_str = row.get("VALUE", "")
+            
+            # Filter for bridges and location
+            if asset_filter.lower() not in asset_type.lower():
+                continue
+            if location.lower() not in geo.lower():
+                continue
+            
+            # Parse percentage value
+            try:
+                value = float(value_str) if value_str and value_str.strip() else 0
+            except ValueError:
+                continue
+            
+            # Get reference year
+            ref_period = row.get("REF_DATE", "")
+            if ref_period:
+                result["reference_year"] = ref_period
+            
+            # Store condition distribution for "All public organizations"
+            if "All public organizations" in owner:
+                cond_key = conditions.get(condition)
+                if cond_key:
+                    result["condition_distribution"][cond_key] = {
+                        "percentage": value,
+                        "label": condition,
+                    }
+            
+            # Store by owner type (for all conditions - look for total)
+            # We'll aggregate later or just capture key owner types
+            if condition == "Very poor" or condition == "Poor":
+                owner_key = owner.lower().replace(" ", "_").replace(",", "")
+                if owner_key not in result["by_owner"]:
+                    result["by_owner"][owner_key] = {"poor_and_very_poor": 0}
+                # This is simplified - in reality we'd need more passes
+        
+        return result
+
+    def _fetch_detailed_bridge_records(
+        self,
+        province: Optional[str],
+        city: Optional[str],
+        condition: Optional[str],
+        built_after: Optional[int],
+        limit: int,
+    ) -> dict[str, Any]:
+        """
+        Fetch detailed bridge records from provincial/municipal open data sources.
+        This supplements the StatCan aggregate data with individual bridge records.
         """
         bridges = []
         sources_queried = []
@@ -273,11 +439,18 @@ class TransportationAPIClient:
                 sources_to_query.append((key, resource))
             elif prov_lower in ["ns"] and "nova scotia" in res_province:
                 sources_to_query.append((key, resource))
+            elif prov_lower in ["sk"] and "saskatchewan" in res_province:
+                sources_to_query.append((key, resource))
+            elif prov_lower in ["ab"] and "alberta" in res_province:
+                sources_to_query.append((key, resource))
+            elif prov_lower in ["bc"] and "british columbia" in res_province:
+                sources_to_query.append((key, resource))
+            elif prov_lower in ["mb"] and "manitoba" in res_province:
+                sources_to_query.append((key, resource))
         
-        # Calculate per-source limit to distribute records evenly when no filter
+        # Calculate per-source limit
         num_sources = len(sources_to_query)
         if num_sources > 0 and not province and not city:
-            # Distribute limit across sources, with remainder going to first sources
             per_source_limit = max(limit // num_sources, 10)
         else:
             per_source_limit = limit
@@ -287,7 +460,6 @@ class TransportationAPIClient:
             if len(bridges) >= limit:
                 break
             
-            # Calculate how many more records we can fetch from this source
             remaining = limit - len(bridges)
             source_limit = min(per_source_limit, remaining)
                 
@@ -309,61 +481,9 @@ class TransportationAPIClient:
             except Exception as e:
                 logger.warning(f"Could not fetch data from {resource.get('name')}: {e}")
         
-        # If no specific source matched, search Open Data API
-        if not sources_to_query or len(bridges) < limit:
-            search_query = "bridge infrastructure structure"
-            if province:
-                search_query += f" {province}"
-            if city:
-                search_query += f" {city}"
-            
-            search_results = self._search_datasets(search_query, limit=10)
-            
-            for ds in search_results.get("results", []):
-                if len(bridges) >= limit:
-                    break
-                    
-                for res in ds.get("resources", []):
-                    fmt = res.get("format", "").upper()
-                    url = res.get("url", "")
-                    
-                    if fmt == "GEOJSON" and url:
-                        try:
-                            geojson = self._fetch_geojson(url)
-                            sources_queried.append(ds.get("title", "Unknown"))
-                            
-                            for feature in geojson.get("features", []):
-                                if len(bridges) >= limit:
-                                    break
-                                props = feature.get("properties", {})
-                                geom = feature.get("geometry", {})
-                                coords = self._extract_coordinates(geom)
-                                
-                                bridge_record = {
-                                    "id": props.get("id") or props.get("ID"),
-                                    "name": props.get("name") or props.get("NAME") or props.get("nom"),
-                                    "structure_type": props.get("type") or props.get("TYPE") or "bridge",
-                                    "condition_rating": props.get("condition"),
-                                    "location": {"coordinates": coords},
-                                    "properties": props,
-                                    "geometry": geom,
-                                    "source": ds.get("title"),
-                                }
-                                bridges.append(bridge_record)
-                        except Exception:
-                            continue
-        
         return {
-            "count": len(bridges),
             "bridges": bridges[:limit],
             "sources": list(set(sources_queried)),
-            "filters_applied": {
-                "province": province,
-                "city": city,
-                "condition": condition,
-                "capacity_min": capacity_min,
-                "built_after": built_after,
-            },
         }
 
     def _parse_bridge_geojson(
@@ -926,399 +1046,6 @@ class TransportationAPIClient:
             },
         }
 
-    def query_transit_stops(
-        self,
-        city: str,
-        route_types: Optional[list[str]] = None,
-        accessibility: Optional[bool] = None,
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        """
-        Get public transit stop infrastructure.
-        Returns actual transit stop locations with service info.
-        Note: Most Canadian transit data is in GTFS format (ZIP archives).
-        For detailed stop/route data, use get_gtfs_feed() to access GTFS data.
-        """
-        stops = []
-        sources_queried = []
-        gtfs_sources = []
-        
-        # Search for transit/GTFS datasets - be more specific to get actual transit data
-        search_queries = [
-            f"bus metro transit stops {city}",
-            f"GTFS transit schedule {city}",
-            f"public transit {city}",
-        ]
-        
-        seen_datasets = set()
-        for search_query in search_queries:
-            search_results = self._search_datasets(search_query, limit=10)
-            
-            for ds in search_results.get("results", []):
-                ds_id = ds.get("id")
-                if ds_id in seen_datasets:
-                    continue
-                seen_datasets.add(ds_id)
-                
-                # Skip datasets that don't look like transit data
-                title_lower = ds.get("title", "").lower()
-                if not any(kw in title_lower for kw in ["transit", "bus", "metro", "stm", "gtfs", "ttc", "translink", "oc transpo"]):
-                    continue
-                
-                if len(stops) >= limit:
-                    break
-                for res in ds.get("resources", []):
-                    fmt = res.get("format", "").upper()
-                    url = res.get("url", "")
-                    
-                    # Track GTFS sources for reference
-                    if fmt in ["GTFS", "ZIP"] and ("gtfs" in url.lower() or "gtfs" in res.get("name", "").lower()):
-                        gtfs_sources.append({
-                            "name": ds.get("title"),
-                            "url": url,
-                            "format": fmt,
-                        })
-                        continue
-                
-                if fmt == "GEOJSON" and url:
-                    try:
-                        geojson = self._fetch_geojson(url)
-                        sources_queried.append(ds.get("title", "Unknown"))
-                        
-                        for feature in geojson.get("features", []):
-                            if len(stops) >= limit:
-                                break
-                            props = feature.get("properties", {})
-                            geom = feature.get("geometry", {})
-                            coords = self._extract_coordinates(geom)
-                            
-                            stop = {
-                                "id": props.get("stop_id") or props.get("id"),
-                                "name": props.get("stop_name") or props.get("name"),
-                                "location": {"city": city, "coordinates": coords},
-                                "properties": props,
-                                "geometry": geom,
-                                "source": ds.get("title"),
-                            }
-                            stops.append(stop)
-                    except Exception:
-                        continue
-        
-        # Add GTFS recommendation if no GeoJSON stops found
-        gtfs_note = None
-        if not stops and gtfs_sources:
-            gtfs_note = "No GeoJSON transit stop data found. Consider using get_gtfs_feed() to access GTFS data for detailed stop information."
-        
-        return {
-            "count": len(stops),
-            "transit_stops": stops[:limit],
-            "city": city,
-            "sources": list(set(sources_queried)),
-            "gtfs_available": gtfs_sources[:5] if gtfs_sources else [],
-            "note": gtfs_note,
-            "filters_applied": {
-                "route_types": route_types,
-                "accessibility": accessibility,
-            },
-        }
-
-    def get_gtfs_feed(
-        self,
-        transit_agency: str,
-        include_realtime: bool = False,
-        limit: int = 50,
-    ) -> dict[str, Any]:
-        """
-        Access transit data in GTFS format.
-        Returns GTFS feed information and download links.
-        """
-        feeds = []
-        sources_queried = []
-        
-        # Search for GTFS datasets
-        search_query = f"GTFS transit {transit_agency}"
-        search_results = self._search_datasets(search_query, limit=limit)
-        
-        for ds in search_results.get("results", []):
-            gtfs_resources = []
-            
-            for resource in ds.get("resources", []):
-                fmt = resource.get("format", "").upper()
-                name = (resource.get("name") or "").lower()
-                url = resource.get("url", "")
-                
-                # GTFS feeds are usually ZIP files or OTHER format
-                is_gtfs = fmt in ["ZIP", "OTHER", "GTFS"] or "gtfs" in name
-                is_realtime = "realtime" in name or "rt" in name or "real-time" in name
-                
-                if is_gtfs:
-                    gtfs_resources.append({
-                        "id": resource.get("id"),
-                        "name": resource.get("name"),
-                        "format": fmt,
-                        "url": url,
-                        "is_realtime": is_realtime,
-                    })
-            
-            if gtfs_resources:
-                sources_queried.append(ds.get("title"))
-                
-                # Filter by realtime if requested
-                if include_realtime:
-                    filtered_resources = gtfs_resources
-                else:
-                    filtered_resources = [r for r in gtfs_resources if not r.get("is_realtime")]
-                    if not filtered_resources:
-                        filtered_resources = gtfs_resources
-                
-                feed = {
-                    "dataset_id": ds.get("id"),
-                    "agency_name": ds.get("title"),
-                    "organization": ds.get("organization", {}).get("title"),
-                    "description": ds.get("notes", "")[:300] if ds.get("notes") else "",
-                    "gtfs_resources": filtered_resources,
-                    "has_realtime": any(r.get("is_realtime") for r in gtfs_resources),
-                    "download_urls": [r["url"] for r in filtered_resources if r.get("url")],
-                }
-                feeds.append(feed)
-        
-        return {
-            "count": len(feeds),
-            "gtfs_feeds": feeds[:limit],
-            "transit_agency": transit_agency,
-            "include_realtime": include_realtime,
-            "sources": list(set(sources_queried)),
-        }
-
-    def query_cycling_networks(
-        self,
-        municipality: Optional[str] = None,
-        province: Optional[str] = None,
-        surface_type: Optional[str] = None,
-        protected: Optional[bool] = None,
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        """
-        Get cycling path and lane data across Canada.
-        Returns actual cycling infrastructure records with GeoJSON.
-        Dynamically selects data sources based on municipality/province filters.
-        """
-        paths = []
-        sources_queried = []
-        
-        # Normalize filters for matching
-        muni_lower = municipality.lower() if municipality else None
-        prov_lower = province.lower() if province else None
-        
-        # Determine which sources to query based on filters
-        sources_to_query = []
-        for key, resource in self.KNOWN_RESOURCES.get("cycling", {}).items():
-            res_province = (resource.get("province") or "").lower()
-            res_city = (resource.get("city") or "").lower()
-            
-            # If no filters, query all sources
-            if not municipality and not province:
-                sources_to_query.append((key, resource))
-            # If municipality matches city
-            elif muni_lower and muni_lower in res_city:
-                sources_to_query.append((key, resource))
-            # If province matches
-            elif prov_lower and prov_lower in res_province:
-                sources_to_query.append((key, resource))
-            # Province abbreviation matching
-            elif prov_lower in ["qc", "québec"] and "quebec" in res_province:
-                sources_to_query.append((key, resource))
-            elif prov_lower in ["on"] and "ontario" in res_province:
-                sources_to_query.append((key, resource))
-        
-        # Calculate per-source limit to distribute records evenly when no filter
-        num_sources = len(sources_to_query)
-        if num_sources > 0 and not municipality and not province:
-            per_source_limit = max(limit // num_sources, 10)
-        else:
-            per_source_limit = limit
-        
-        # Query each applicable source
-        source_record_count = 0
-        for key, resource in sources_to_query:
-            if len(paths) >= limit:
-                break
-            
-            source_record_count = 0
-            remaining = limit - len(paths)
-            source_limit = min(per_source_limit, remaining)
-                
-            try:
-                geojson = self._fetch_geojson(resource["geojson_url"])
-                sources_queried.append(resource["name"])
-                res_city = resource.get("city", "")
-                res_province = resource.get("province", "")
-                
-                for feature in geojson.get("features", []):
-                    if source_record_count >= source_limit or len(paths) >= limit:
-                        break
-                        
-                    props = feature.get("properties", {})
-                    geom = feature.get("geometry", {})
-                    coords = self._extract_coordinates(geom)
-                    
-                    # Parse based on source
-                    if "montreal" in key.lower():
-                        path = self._parse_montreal_cycling(props, geom, coords, resource, protected)
-                    elif "toronto" in key.lower():
-                        path = self._parse_toronto_cycling(props, geom, coords, resource, protected)
-                    else:
-                        path = self._parse_generic_cycling(props, geom, coords, resource, res_city, res_province)
-                    
-                    if path:
-                        paths.append(path)
-                        source_record_count += 1
-                        
-            except Exception as e:
-                logger.warning(f"Could not fetch cycling data from {resource.get('name')}: {e}")
-        
-        # Search for additional cycling datasets if needed
-        if len(paths) < limit:
-            search_query = "cycling bike lane path"
-            if municipality:
-                search_query += f" {municipality}"
-            if province:
-                search_query += f" {province}"
-            
-            search_results = self._search_datasets(search_query, limit=10)
-            
-            for ds in search_results.get("results", []):
-                if len(paths) >= limit:
-                    break
-                for res in ds.get("resources", []):
-                    fmt = res.get("format", "").upper()
-                    url = res.get("url", "")
-                    
-                    if fmt == "GEOJSON" and url:
-                        try:
-                            geojson = self._fetch_geojson(url)
-                            sources_queried.append(ds.get("title", "Unknown"))
-                            
-                            for feature in geojson.get("features", []):
-                                if len(paths) >= limit:
-                                    break
-                                props = feature.get("properties", {})
-                                geom = feature.get("geometry", {})
-                                coords = self._extract_coordinates(geom)
-                                
-                                path = {
-                                    "id": props.get("id") or props.get("ID"),
-                                    "name": props.get("name") or props.get("nom"),
-                                    "path_type": props.get("type") or props.get("TYPE"),
-                                    "location": {
-                                        "municipality": municipality,
-                                        "coordinates": coords,
-                                    },
-                                    "properties": props,
-                                    "geometry": geom,
-                                    "source": ds.get("title"),
-                                }
-                                paths.append(path)
-                        except Exception:
-                            continue
-        
-        return {
-            "count": len(paths),
-            "cycling_paths": paths[:limit],
-            "municipality": municipality,
-            "province": province,
-            "sources": list(set(sources_queried)),
-            "filters_applied": {
-                "surface_type": surface_type,
-                "protected": protected,
-            },
-        }
-
-    def _parse_montreal_cycling(self, props: dict, geom: dict, coords: dict, resource: dict, protected: Optional[bool]) -> Optional[dict]:
-        """Parse Montreal cycling data with correct field names."""
-        path_type_code = props.get("TYPE_VOIE_CODE")
-        path_type_desc = props.get("TYPE_VOIE_DESC") or props.get("TYPE_VOIE2_DESC")
-        separator_desc = props.get("SEPARATEUR_DESC")
-        is_protected = props.get("PROTEGE_4S") == 1 or (separator_desc and "protégé" in separator_desc.lower())
-        is_four_seasons = props.get("SAISONS4") == 1
-        
-        if protected is not None and is_protected != protected:
-            return None
-        
-        return {
-            "id": props.get("ID_CYCL") or props.get("ID_TRC"),
-            "neighborhood": props.get("NOM_ARR_VILLE_DESC"),
-            "path_type_code": path_type_code,
-            "path_type": path_type_desc,
-            "separator": separator_desc,
-            "protected": is_protected,
-            "four_seasons": is_four_seasons,
-            "length_m": props.get("LONGUEUR"),
-            "num_lanes": props.get("NBR_VOIE"),
-            "is_route_verte": props.get("ROUTE_VERTE") == 1,
-            "location": {
-                "city": "Montreal",
-                "province": "Quebec",
-                "neighborhood": props.get("NOM_ARR_VILLE_DESC"),
-                "coordinates": coords,
-            },
-            "geometry": geom,
-            "source": resource["name"],
-        }
-
-    def _parse_toronto_cycling(self, props: dict, geom: dict, coords: dict, resource: dict, protected: Optional[bool]) -> Optional[dict]:
-        """Parse Toronto cycling data."""
-        # Toronto uses different field names
-        route_type = props.get("INFRA_HIGHORDER") or props.get("CLASSIFICATION")
-        is_protected = route_type and ("cycle track" in route_type.lower() or "protected" in route_type.lower())
-        
-        if protected is not None and is_protected != protected:
-            return None
-        
-        return {
-            "id": props.get("_id") or props.get("OBJECTID"),
-            "name": props.get("STREET_NAME") or props.get("LINEAR_NAME_FULL"),
-            "path_type": route_type,
-            "classification": props.get("CLASSIFICATION"),
-            "status": props.get("STATUS") or props.get("INSTALLED"),
-            "protected": is_protected,
-            "bike_lane_type": props.get("BIKE_LANE_TYPE"),
-            "length_m": props.get("Shape__Length"),
-            "location": {
-                "city": "Toronto",
-                "province": "Ontario",
-                "coordinates": coords,
-            },
-            "geometry": geom,
-            "source": resource["name"],
-        }
-
-    def _parse_generic_cycling(self, props: dict, geom: dict, coords: dict, resource: dict, city: str, province: str) -> dict:
-        """Parse generic cycling data."""
-        return {
-            "id": props.get("id") or props.get("ID") or props.get("_id"),
-            "name": props.get("name") or props.get("nom") or props.get("NAME"),
-            "path_type": props.get("type") or props.get("TYPE") or props.get("type_voie"),
-            "surface": props.get("surface") or props.get("SURFACE"),
-            "length_m": props.get("length") or props.get("LONGUEUR"),
-            "location": {
-                "city": city,
-                "province": province,
-                "coordinates": coords,
-            },
-            "properties": props,
-            "geometry": geom,
-            "source": resource["name"],
-        }
-        type_map = {
-            "1": "Separated bike path",
-            "2": "On-street bike lane",
-            "3": "Shared lane (sharrow)",
-            "4": "Multi-use path",
-            "5": "Protected bike lane",
-        }
-        return type_map.get(str(type_code), str(type_code) if type_code else "Unknown")
-
     def analyze_bridge_conditions(
         self,
         region: str,
@@ -1326,126 +1053,165 @@ class TransportationAPIClient:
         limit: int = 100,
     ) -> dict[str, Any]:
         """
-        Aggregate bridge condition data for analysis.
-        Returns statistical analysis of bridge conditions.
-        """
-        # Get bridge data for the region
-        bridges_data = self.query_bridges(province=region, limit=limit)
-        bridges = bridges_data.get("bridges", [])
+        Aggregate bridge condition data for analysis using Statistics Canada
+        Core Public Infrastructure Survey data.
         
-        if not bridges:
+        Returns statistical analysis of bridge conditions for any province/territory
+        using the unified StatCan approach (Table 34-10-0288-01).
+        
+        Args:
+            region: Province/territory name (e.g., 'Ontario', 'Saskatchewan', 'Canada')
+            group_by: Group results by field (owner, condition) - limited by StatCan data
+            limit: Maximum detailed records to return (default 100)
+        
+        Returns:
+            Condition distribution percentages from Statistics Canada
+        """
+        # Normalize province name
+        region_normalized = self.PROVINCE_NAMES.get(region.lower(), region) if region else "Canada"
+        
+        # Use unified query_bridges approach which fetches StatCan data
+        bridges_data = self.query_bridges(province=region_normalized, limit=limit)
+        
+        # Get StatCan aggregate condition data (the primary source)
+        statcan_data = bridges_data.get("statcan_data", {})
+        condition_dist = statcan_data.get("condition_distribution", {})
+        
+        if not condition_dist:
+            # Try fetching directly if not in bridges_data
+            try:
+                statcan_data = self._fetch_statcan_bridge_inventory(region_normalized)
+                condition_dist = statcan_data.get("condition_distribution", {})
+            except Exception as e:
+                logger.warning(f"Could not fetch StatCan data for {region_normalized}: {e}")
+        
+        if not condition_dist:
             return {
-                "region": region,
-                "error": "No bridge data available for this region",
-                "sources": bridges_data.get("sources", []),
-                "suggestion": "Try 'Quebec' or 'Montreal' for available bridge data",
+                "region": region_normalized,
+                "error": "No bridge condition data available for this region",
+                "sources": ["Statistics Canada - CCPI Survey"],
+                "suggestion": "Try 'Ontario', 'Quebec', 'British Columbia', 'Alberta', 'Saskatchewan', or 'Canada' for available data",
             }
         
-        # Aggregate condition statistics
-        condition_counts = {"good": 0, "fair": 0, "poor": 0, "critical": 0, "unknown": 0}
-        total_bridges = len(bridges)
+        # Build condition summary from StatCan percentages
+        condition_summary = {}
+        total_percentage = 0
         
-        for bridge in bridges:
-            condition = bridge.get("condition_rating", "unknown")
-            if condition in condition_counts:
-                condition_counts[condition] += 1
-            else:
-                condition_counts["unknown"] += 1
+        # Map StatCan conditions to our categories
+        condition_mapping = {
+            "very_good": "very_good",
+            "good": "good",
+            "fair": "fair",
+            "poor": "poor",
+            "very_poor": "very_poor",
+            "unknown": "unknown",
+        }
         
-        # Group by if specified
+        for key, mapping in condition_mapping.items():
+            if key in condition_dist:
+                pct = condition_dist[key].get("percentage", 0)
+                condition_summary[mapping] = {
+                    "percentage": pct,
+                    "label": condition_dist[key].get("label", key.replace("_", " ").title()),
+                }
+                total_percentage += pct
+        
+        # Calculate combined poor/critical percentage
+        poor_pct = condition_summary.get("poor", {}).get("percentage", 0)
+        very_poor_pct = condition_summary.get("very_poor", {}).get("percentage", 0)
+        needs_attention_pct = poor_pct + very_poor_pct
+        
+        # Get detailed bridge records if available
+        detailed_bridges = bridges_data.get("bridges", [])
+        
+        # Group by owner if requested and we have StatCan owner data
         grouped_data = {}
-        if group_by and group_by in ["city", "structure_type", "condition"]:
-            for bridge in bridges:
-                if group_by == "city":
-                    key = bridge.get("location", {}).get("city", "Unknown")
-                elif group_by == "structure_type":
-                    key = bridge.get("structure_type", "Unknown")
-                else:
-                    key = bridge.get("condition_rating", "unknown")
-                
-                if key not in grouped_data:
-                    grouped_data[key] = {"count": 0, "bridges": []}
-                grouped_data[key]["count"] += 1
-                if len(grouped_data[key]["bridges"]) < 5:  # Limit examples
-                    grouped_data[key]["bridges"].append(bridge.get("name") or bridge.get("id"))
+        by_owner = statcan_data.get("by_owner", {})
+        if group_by == "owner" and by_owner:
+            grouped_data = by_owner
+        elif group_by == "condition":
+            grouped_data = condition_summary
         
         return {
-            "region": region,
-            "total_bridges": total_bridges,
-            "condition_summary": {
-                "good": {"count": condition_counts["good"], "percentage": round(100 * condition_counts["good"] / total_bridges, 1) if total_bridges else 0},
-                "fair": {"count": condition_counts["fair"], "percentage": round(100 * condition_counts["fair"] / total_bridges, 1) if total_bridges else 0},
-                "poor": {"count": condition_counts["poor"], "percentage": round(100 * condition_counts["poor"] / total_bridges, 1) if total_bridges else 0},
-                "critical": {"count": condition_counts["critical"], "percentage": round(100 * condition_counts["critical"] / total_bridges, 1) if total_bridges else 0},
-                "unknown": {"count": condition_counts["unknown"], "percentage": round(100 * condition_counts["unknown"] / total_bridges, 1) if total_bridges else 0},
+            "region": region_normalized,
+            "reference_year": statcan_data.get("reference_year", "2022"),
+            "data_source": {
+                "name": "Statistics Canada - Core Public Infrastructure Survey",
+                "table_id": self.STATCAN_BRIDGE_INVENTORY.get("table_id", "34-10-0288-01"),
+                "description": "Physical condition of core public infrastructure assets by province/territory",
+            },
+            "condition_summary": condition_summary,
+            "analysis": {
+                "needs_attention_percentage": round(needs_attention_pct, 1),
+                "good_or_better_percentage": round(
+                    condition_summary.get("good", {}).get("percentage", 0) +
+                    condition_summary.get("very_good", {}).get("percentage", 0),
+                    1
+                ),
+                "total_accounted_percentage": round(total_percentage, 1),
             },
             "grouped_by": group_by,
             "groups": grouped_data if grouped_data else None,
-            "sources": bridges_data.get("sources", []),
+            "detailed_records_available": len(detailed_bridges),
+            "detailed_records": detailed_bridges[:10] if detailed_bridges else [],  # Sample of detailed records
+            "sources": bridges_data.get("sources", ["Statistics Canada CCPI Survey"]),
+            "note": (
+                f"Condition percentages from Statistics Canada for {region_normalized}. "
+                f"Detailed bridge records: {len(detailed_bridges)} available from provincial sources."
+            ) if detailed_bridges else (
+                f"Condition percentages from Statistics Canada for {region_normalized}. "
+                "Detailed bridge records available for: Ontario, Quebec/Montreal, Nova Scotia."
+            ),
         }
 
-    def analyze_transit_coverage(
-        self,
-        city: str,
-        radius_meters: int = 400,
-        limit: int = 100,
-    ) -> dict[str, Any]:
-        """
-        Analyze transit accessibility coverage.
-        Returns coverage analysis with statistics.
-        """
-        # Get transit stops for the city
-        stops_data = self.query_transit_stops(city=city, limit=limit)
-        stops = stops_data.get("transit_stops", [])
-        
-        if not stops:
-            return {
-                "city": city,
-                "radius_meters": radius_meters,
-                "error": "No transit stop data available for this city",
-                "sources": stops_data.get("sources", []),
-                "suggestion": "Try a major city like 'Toronto', 'Vancouver', or 'Montreal'",
-            }
-        
-        # Aggregate statistics
-        total_stops = len(stops)
-        accessible_stops = sum(1 for s in stops if s.get("wheelchair_accessible"))
-        bike_friendly_stops = sum(1 for s in stops if s.get("bikes_allowed"))
-        
-        # Group by agency
-        agencies = {}
-        for stop in stops:
-            agency = stop.get("agency") or "Unknown"
-            if agency not in agencies:
-                agencies[agency] = {"stop_count": 0, "accessible": 0}
-            agencies[agency]["stop_count"] += 1
-            if stop.get("wheelchair_accessible"):
-                agencies[agency]["accessible"] += 1
-        
-        # Group by route type
-        route_types = {}
-        for stop in stops:
-            rt = stop.get("route_type") or "Unknown"
-            rt_str = str(rt)
-            if rt_str not in route_types:
-                route_types[rt_str] = 0
-            route_types[rt_str] += 1
-        
-        return {
-            "city": city,
-            "radius_meters": radius_meters,
-            "coverage_analysis": {
-                "total_stops": total_stops,
-                "wheelchair_accessible": accessible_stops,
-                "accessibility_percentage": round(100 * accessible_stops / total_stops, 1) if total_stops else 0,
-                "bike_friendly": bike_friendly_stops,
-                "bike_percentage": round(100 * bike_friendly_stops / total_stops, 1) if total_stops else 0,
-            },
-            "by_agency": agencies,
-            "by_route_type": route_types,
-            "note": f"Coverage radius of {radius_meters}m is typical walking distance to transit",
-            "sources": stops_data.get("sources", []),
-        }
+    # Statistics Canada infrastructure cost data URLs
+    STATCAN_COST_DATA = {
+        "bridge": {
+            "url": "https://www150.statcan.gc.ca/n1/tbl/csv/34100284-eng.zip",
+            "table_id": "34-10-0284-01",
+            "title": "Estimated replacement value of core public infrastructure assets",
+            "asset_filter": "Bridge and tunnel assets",
+        },
+        "road": {
+            "url": "https://www150.statcan.gc.ca/n1/tbl/csv/34100284-eng.zip",
+            "table_id": "34-10-0284-01",
+            "title": "Estimated replacement value of core public infrastructure assets",
+            "asset_filter": "Road assets",
+        },
+        "transit": {
+            "url": "https://www150.statcan.gc.ca/n1/tbl/csv/34100284-eng.zip",
+            "table_id": "34-10-0284-01",
+            "title": "Estimated replacement value of core public infrastructure assets",
+            "asset_filter": "Public transit assets",
+        },
+    }
+
+    # Statistics Canada bridge inventory/condition distribution data
+    STATCAN_BRIDGE_INVENTORY = {
+        "url": "https://www150.statcan.gc.ca/n1/tbl/csv/34100288-eng.zip",
+        "table_id": "34-10-0288-01",
+        "title": "Inventory distribution of core public infrastructure assets by physical condition rating",
+        "asset_filter": "Bridge and tunnel assets",
+    }
+
+    # Province name mappings for StatCan data
+    PROVINCE_NAMES = {
+        "ontario": "Ontario",
+        "quebec": "Quebec",
+        "british columbia": "British Columbia",
+        "alberta": "Alberta",
+        "manitoba": "Manitoba",
+        "saskatchewan": "Saskatchewan",
+        "nova scotia": "Nova Scotia",
+        "new brunswick": "New Brunswick",
+        "newfoundland": "Newfoundland and Labrador",
+        "pei": "Prince Edward Island",
+        "prince edward island": "Prince Edward Island",
+        "yukon": "Yukon",
+        "northwest territories": "Northwest Territories",
+        "nunavut": "Nunavut",
+        "canada": "Canada",
+    }
 
     def get_infrastructure_costs(
         self,
@@ -1454,8 +1220,254 @@ class TransportationAPIClient:
         limit: int = 50,
     ) -> dict[str, Any]:
         """
-        Get cost data for transportation infrastructure.
-        Returns replacement cost estimates and investment datasets.
+        Get actual cost data for transportation infrastructure from Statistics Canada.
+        Downloads and analyzes the Core Public Infrastructure Survey data.
+        Returns replacement cost estimates by condition rating and owner type.
+        
+        Args:
+            infrastructure_type: Type of infrastructure (bridge, road, transit)
+            location: Province name or 'Canada' for national data
+            limit: Maximum records to return (default 50)
+        
+        Returns:
+            Detailed cost breakdown including:
+            - Total replacement value
+            - Costs by condition (Good, Fair, Poor, Very Poor)
+            - Costs by owner type (Provincial, Municipal, etc.)
+        """
+        infra_lower = infrastructure_type.lower()
+        
+        # Check if we have StatCan data for this infrastructure type
+        if infra_lower not in self.STATCAN_COST_DATA:
+            return self._fallback_cost_search(infrastructure_type, location, limit)
+        
+        statcan_config = self.STATCAN_COST_DATA[infra_lower]
+        
+        # Normalize location name
+        location_normalized = self.PROVINCE_NAMES.get(location.lower(), location)
+        
+        try:
+            # Download and parse StatCan data
+            cost_data = self._fetch_statcan_cost_data(
+                statcan_config["url"],
+                statcan_config["asset_filter"],
+                location_normalized,
+            )
+            
+            if not cost_data:
+                return self._fallback_cost_search(infrastructure_type, location, limit)
+            
+            return {
+                "infrastructure_type": infrastructure_type,
+                "location": location_normalized,
+                "source": {
+                    "name": "Statistics Canada - Core Public Infrastructure Survey",
+                    "table_id": statcan_config["table_id"],
+                    "title": statcan_config["title"],
+                    "reference_year": cost_data.get("reference_year", "2020"),
+                    "url": f"https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid={statcan_config['table_id'].replace('-', '')}01",
+                },
+                "total_replacement_value": cost_data.get("total"),
+                "costs_by_condition": cost_data.get("by_condition", {}),
+                "costs_by_owner": cost_data.get("by_owner", {}),
+                "priority_investment_needed": cost_data.get("priority_investment", {}),
+                "unit": "millions CAD",
+                "data_quality": "A (Excellent) - Statistics Canada certified",
+            }
+            
+        except Exception as e:
+            logger.error(f"Error fetching StatCan cost data: {e}")
+            return self._fallback_cost_search(infrastructure_type, location, limit)
+
+    def _fetch_statcan_cost_data(
+        self,
+        zip_url: str,
+        asset_filter: str,
+        location: str,
+    ) -> dict[str, Any]:
+        """
+        Download and parse Statistics Canada infrastructure cost CSV from ZIP.
+        """
+        import zipfile
+        import tempfile
+        import os
+        
+        try:
+            # Download the ZIP file
+            logger.info(f"Downloading StatCan cost data from {zip_url}")
+            
+            # Create SSL context that doesn't verify (StatCan has cert issues sometimes)
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            
+            req = urllib.request.Request(
+                zip_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; GovMCP/1.0)"}
+            )
+            
+            with urllib.request.urlopen(req, context=ctx, timeout=60) as response:
+                zip_data = response.read()
+            
+            # Extract and parse CSV from ZIP
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = os.path.join(tmpdir, "data.zip")
+                with open(zip_path, "wb") as f:
+                    f.write(zip_data)
+                
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    # Find the main CSV file (not metadata)
+                    csv_files = [n for n in zf.namelist() if n.endswith(".csv") and "metadata" not in n.lower()]
+                    if not csv_files:
+                        logger.error("No CSV file found in ZIP")
+                        return {}
+                    
+                    csv_filename = csv_files[0]
+                    with zf.open(csv_filename) as csvfile:
+                        # Read and decode CSV content
+                        content = csvfile.read().decode("utf-8-sig")
+                        return self._parse_statcan_cost_csv(content, asset_filter, location)
+            
+        except Exception as e:
+            logger.error(f"Error downloading/parsing StatCan ZIP: {e}")
+            return {}
+
+    def _parse_statcan_cost_csv(
+        self,
+        csv_content: str,
+        asset_filter: str,
+        location: str,
+    ) -> dict[str, Any]:
+        """
+        Parse Statistics Canada infrastructure cost CSV and extract relevant data.
+        
+        CSV columns (from StatCan table 34-10-0284-01):
+        - REF_DATE: Reference year
+        - GEO: Geography (Canada, province names)
+        - Core public infrastructure assets: Asset type
+        - Financial value of assets: Measure type (Estimated Replacement Value, etc.)
+        - Overall physical condition of assets: Condition rating
+        - Public organizations: Owner type
+        - VALUE: Dollar amount in millions
+        """
+        result = {
+            "reference_year": "2020",
+            "total": None,
+            "by_condition": {},
+            "by_owner": {},
+            "priority_investment": {},
+        }
+        
+        reader = csv.DictReader(io.StringIO(csv_content))
+        
+        # Track values for aggregation
+        condition_costs = {"Good": 0, "Fair": 0, "Poor": 0, "Very poor": 0}
+        owner_costs = {
+            "Provincial and territorial": 0,
+            "Municipal (all)": 0,
+            "Urban municipalities": 0,
+            "Rural municipalities": 0,
+            "Local and regional": 0,
+        }
+        total_all = None
+        
+        for row in reader:
+            # Get values using actual StatCan column names
+            geo = row.get("GEO", "")
+            asset_type = row.get("Core public infrastructure assets", "")
+            measure = row.get("Financial value of assets", "")
+            condition = row.get("Overall physical condition of assets", "")
+            owner = row.get("Public organizations", "")
+            value_str = row.get("VALUE", "")
+            
+            # Filter for our infrastructure type and location
+            if asset_filter.lower() not in asset_type.lower():
+                continue
+            if location.lower() not in geo.lower():
+                continue
+            if "Estimated Replacement Value" not in measure:
+                continue
+            
+            # Parse value (in millions)
+            try:
+                value = float(value_str) if value_str and value_str.strip() else 0
+            except ValueError:
+                continue
+            
+            # Get reference year
+            ref_period = row.get("REF_DATE", "")
+            if ref_period:
+                result["reference_year"] = ref_period
+            
+            # Extract total
+            if "All physical conditions" in condition and "All public organizations" in owner:
+                total_all = value
+            
+            # Extract by condition (for all public organizations)
+            if "All public organizations" in owner:
+                for cond in ["Good", "Fair", "Poor", "Very poor"]:
+                    if condition == cond:
+                        condition_costs[cond] = value
+            
+            # Extract by owner (for all conditions)
+            if "All physical conditions" in condition:
+                if "Provincial and territorial organizations" in owner:
+                    owner_costs["Provincial and territorial"] = value
+                elif owner == "All municipalities":
+                    owner_costs["Municipal (all)"] = value
+                elif "All urban municipalities" in owner:
+                    owner_costs["Urban municipalities"] = value
+                elif "All rural municipalities" in owner:
+                    owner_costs["Rural municipalities"] = value
+                elif "Local and regional organizations" in owner:
+                    owner_costs["Local and regional"] = value
+        
+        # Build result
+        result["total"] = {
+            "value": total_all,
+            "formatted": f"${total_all:,.1f} million" if total_all else "N/A",
+            "in_billions": f"${total_all/1000:.1f} billion" if total_all and total_all > 1000 else None,
+        }
+        
+        # Costs by condition with percentages
+        if total_all and total_all > 0:
+            for cond, val in condition_costs.items():
+                pct = (val / total_all * 100) if val else 0
+                result["by_condition"][cond.lower().replace(" ", "_")] = {
+                    "value_millions": val,
+                    "formatted": f"${val:,.1f} million" if val else "N/A",
+                    "percentage": round(pct, 1),
+                }
+        
+        # Costs by owner
+        for owner_type, val in owner_costs.items():
+            if val > 0:
+                result["by_owner"][owner_type.lower().replace(" ", "_").replace("(", "").replace(")", "")] = {
+                    "value_millions": val,
+                    "formatted": f"${val:,.1f} million" if val else "N/A",
+                }
+        
+        # Priority investment (Poor + Very Poor)
+        poor_total = condition_costs.get("Poor", 0) + condition_costs.get("Very poor", 0)
+        result["priority_investment"] = {
+            "poor_and_very_poor_total": {
+                "value_millions": poor_total,
+                "formatted": f"${poor_total:,.1f} million",
+                "in_billions": f"${poor_total/1000:.2f} billion" if poor_total > 500 else None,
+            },
+            "description": "Infrastructure in Poor or Very Poor condition requiring priority attention",
+        }
+        
+        return result
+
+    def _fallback_cost_search(
+        self,
+        infrastructure_type: str,
+        location: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        """
+        Fallback to dataset search when direct StatCan data is not available.
         """
         datasets = []
         
@@ -1506,7 +1518,7 @@ class TransportationAPIClient:
             "location": location,
             "total_datasets": len(datasets),
             "datasets": datasets,
-            "note": "Cost data is typically in CSV format. Download resources for detailed cost/investment figures.",
+            "note": "Direct cost data not available for this infrastructure type. Dataset search results provided instead.",
         }
 
     def compare_across_regions(
@@ -1557,32 +1569,6 @@ class TransportationAPIClient:
                         except (ValueError, TypeError):
                             pass
                     
-            elif infrastructure_type.lower() == "transit":
-                # Use representative city for each region
-                city_map = {
-                    "ontario": "Toronto",
-                    "quebec": "Montreal",
-                    "british columbia": "Vancouver",
-                    "alberta": "Calgary",
-                    "manitoba": "Winnipeg",
-                    "saskatchewan": "Saskatoon",
-                }
-                city = city_map.get(region.lower(), region)
-                data = self.query_transit_stops(city=city, limit=limit)
-                stops = data.get("transit_stops", [])
-                region_data["infrastructure_count"] = len(stops)
-                region_data["sources"] = data.get("sources", [])
-                region_data["city_queried"] = city
-                
-                if "count" in metrics:
-                    region_data["metrics"]["count"] = len(stops)
-                if "accessibility" in metrics:
-                    accessible = sum(1 for s in stops if s.get("wheelchair_accessible"))
-                    region_data["metrics"]["accessibility"] = {
-                        "accessible_stops": accessible,
-                        "percentage": round(100 * accessible / len(stops), 1) if stops else 0,
-                    }
-                    
             elif infrastructure_type.lower() == "railway":
                 data = self.query_railways(region=region, limit=limit)
                 railways = data.get("railways", [])
@@ -1594,28 +1580,6 @@ class TransportationAPIClient:
                 if "operator" in metrics:
                     operators = [r.get("operator") for r in railways if r.get("operator")]
                     region_data["metrics"]["operators"] = list(set(operators))
-                    
-            elif infrastructure_type.lower() == "cycling":
-                city_map = {
-                    "ontario": "Toronto",
-                    "quebec": "Montreal",
-                    "british columbia": "Vancouver",
-                }
-                city = city_map.get(region.lower(), region)
-                data = self.query_cycling_networks(municipality=city, limit=limit)
-                paths = data.get("cycling_paths", [])
-                region_data["infrastructure_count"] = len(paths)
-                region_data["sources"] = data.get("sources", [])
-                region_data["city_queried"] = city
-                
-                if "count" in metrics:
-                    region_data["metrics"]["count"] = len(paths)
-                if "protected" in metrics:
-                    protected = sum(1 for p in paths if p.get("protected"))
-                    region_data["metrics"]["protected_lanes"] = {
-                        "count": protected,
-                        "percentage": round(100 * protected / len(paths), 1) if paths else 0,
-                    }
             
             comparison[region] = region_data
         

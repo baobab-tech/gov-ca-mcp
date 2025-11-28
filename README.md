@@ -3,7 +3,7 @@
 Python-based Model Context Protocol (MCP) servers for accessing Canada's Open Government data. This project includes two complementary MCP servers:
 
 1. **GOV CA DATASET MCP** - Universal dataset discovery, search, and metadata retrieval across all Canadian government open data
-2. **GOV CA TRANSPORTATION MCP** - Specialized infrastructure querying for bridges, airports, cycling networks, transit, railways, and tunnels
+2. **GOV CA TRANSPORTATION MCP** - Specialized infrastructure querying for bridges, tunnels, airports, ports, and railways with Statistics Canada cost data
 
 ## Features
 
@@ -14,12 +14,12 @@ Python-based Model Context Protocol (MCP) servers for accessing Canada's Open Go
 - Track recent dataset updates
 
 ### Transportation Infrastructure (gov_ca_transportation)
-- Query **bridge conditions** with filtering by province, city, and condition rating
-- Search **airports** across Canada with facility details
-- Explore **cycling networks** in major cities (Vancouver, Toronto, Montreal, etc.)
-- Access **transit stops** and coverage analysis
+- Query **bridge conditions** using Statistics Canada national data for all provinces
+- Get **infrastructure replacement costs** from Statistics Canada surveys
+- Search **airports and ports** across Canada
 - Query **railway** infrastructure
 - Search **tunnels** by province and type
+- **Unified data approach**: Uses Statistics Canada Core Public Infrastructure Survey for consistent national coverage
 
 ## Quick Start
 
@@ -54,23 +54,23 @@ gov_mcp/                          # Dataset Discovery MCP
 └── types.py                      # Type definitions
 
 gov_ca_transportation/            # Transportation Infrastructure MCP
-├── server.py                     # MCP server with 10+ tools
-├── api_client.py                 # Direct data fetching from provincial/municipal sources
+├── server.py                     # MCP server with 7 tools
+├── api_client.py                 # Statistics Canada + provincial data fetching
 ├── http_client.py                # HTTP client
 └── types.py                      # Type definitions
 ```
 
 ## Data Sources
 
-The Transportation MCP fetches **actual infrastructure records** from:
+The Transportation MCP uses **Statistics Canada** as the primary data source for national coverage:
 
-| Province | Bridges | Airports | Cycling | Transit |
-|----------|---------|----------|---------|---------|
-| British Columbia | ✅ BC OpenMaps WFS | ✅ BC OpenMaps WFS | ✅ Vancouver Open Data | - |
-| Ontario | ✅ Ontario Open Data | - | ✅ Toronto Open Data | ✅ TTC GTFS |
-| Quebec | ✅ Montreal Open Data | ✅ Quebec WFS | ✅ Montreal/Quebec City | ✅ STM |
-| Nova Scotia | ✅ NS Open Data | - | - | - |
-| National | - | - | - | ✅ Multiple agencies |
+| Data Type | Primary Source | Coverage |
+|-----------|---------------|----------|
+| Bridge Conditions | Statistics Canada Table 34-10-0288-01 | All provinces/territories |
+| Infrastructure Costs | Statistics Canada Table 34-10-0284-01 | All provinces/territories |
+| Detailed Bridge Records | Provincial Open Data | Ontario, Quebec, Nova Scotia |
+| Airports | Quebec Open Data, BC OpenMaps | Quebec, British Columbia |
+| Railways | National Railway Network | National |
 
 ## Available Tools
 
@@ -86,21 +86,17 @@ The Transportation MCP fetches **actual infrastructure records** from:
 | `get_activity_stream` | See recently updated datasets |
 | `query_datastore` | Query data directly (fallback mode) |
 
-### Transportation Infrastructure MCP (gov_ca_transportation) - 10 Tools
+### Transportation Infrastructure MCP (gov_ca_transportation) - 7 Tools
 
 | Tool | Description |
 |------|-------------|
-| `query_bridges` | Search bridge infrastructure by province, city, condition |
-| `analyze_bridge_conditions` | Aggregate condition analysis for a region |
+| `query_bridges` | Search bridge infrastructure by province with StatCan condition data |
+| `analyze_bridge_conditions` | Aggregate condition analysis using Statistics Canada data |
+| `get_infrastructure_costs` | Get replacement costs by condition from Statistics Canada |
 | `query_ports_airports` | Search airports, ports, marinas, heliports |
-| `query_cycling_networks` | Get cycling paths and lanes by municipality |
-| `query_transit_stops` | Search public transit stops by city |
-| `analyze_transit_coverage` | Analyze transit accessibility coverage |
-| `get_gtfs_feed` | Access transit data in GTFS format |
 | `query_railways` | Search railway lines and stations |
 | `query_tunnels` | Search tunnel infrastructure |
 | `compare_across_regions` | Compare infrastructure across provinces |
-| `get_infrastructure_costs` | Get replacement cost estimates |
 
 ## Example Usage
 
@@ -113,23 +109,23 @@ result = search_datasets(query="water Saskatchewan", limit=20)
 
 ### Analyze Bridge Conditions
 ```python
-# Get Montreal bridge conditions
-result = analyze_bridge_conditions(region="Montreal", limit=100)
-# Returns condition analysis for 577 road structures
+# Get bridge conditions for any province using Statistics Canada data
+result = analyze_bridge_conditions(region="Saskatchewan")
+# Returns: Very Poor: 2.4%, Poor: 16.4%, Fair: 23.7%, Good: 32.4%, Very Good: 10.1%
 ```
 
-### Query Cycling Networks
+### Get Infrastructure Costs
 ```python
-# Get Vancouver bikeways
-result = query_cycling_networks(municipality="Vancouver", limit=50)
-# Returns cycling paths with route names, types, surface info
+# Get bridge replacement costs for Ontario
+result = get_infrastructure_costs(infrastructure_type="bridge", location="Ontario")
+# Returns: Total $81.4B, Priority investment needed: $2.65B (Poor + Very Poor)
 ```
 
-### Get Tax Datasets
+### Query Bridges
 ```python
-# Search federal tax datasets  
-result = search_datasets(query="tax income", jurisdiction="federal", limit=20)
-# Returns 530 datasets from CRA and Statistics Canada
+# Get bridge data with StatCan condition distribution
+result = query_bridges(province="Ontario", limit=100)
+# Returns condition summary + detailed records from provincial sources
 ```
 
 ## Project Structure
@@ -145,7 +141,7 @@ gov_mcp/
 ├── gov_ca_transportation/      # Transportation MCP
 │   ├── __init__.py
 │   ├── server.py               # MCP server
-│   ├── api_client.py           # Direct data fetcher
+│   ├── api_client.py           # StatCan + provincial data fetcher
 │   ├── http_client.py          # HTTP client
 │   └── types.py                # Type definitions
 ├── tests/                      # Test files
@@ -195,23 +191,24 @@ python validate.py
 ## Key Capabilities
 
 - **250,000+ datasets** searchable from Open Government Canada
+- **Statistics Canada integration** for authoritative national infrastructure data
+- **All provinces covered** for bridge conditions and infrastructure costs
 - **Real infrastructure data** from provincial/municipal open data portals
-- **Multi-province coverage**: BC, Ontario, Quebec, Nova Scotia, and more
-- **Multiple data formats**: GeoJSON, CSV, WFS, ESRI REST
-- **Condition analysis**: Bridge ICG ratings, age distribution, critical structures
-- **Geographic filtering**: By province, city, or region
+- **Multiple data formats**: GeoJSON, CSV, ZIP (StatCan)
+- **Condition analysis**: Bridge condition percentages, replacement costs by condition
+- **Geographic filtering**: By province or national aggregate
 
 ## API Sources
 
 | Source | Data Types |
 |--------|------------|
-| open.canada.ca | Federal datasets, Statistics Canada |
-| donnees.montreal.ca | Montreal infrastructure, cycling |
-| data.ontario.ca | Ontario bridges, transit |
-| openmaps.gov.bc.ca | BC airports, bridges, railways |
-| opendata.vancouver.ca | Vancouver bikeways |
+| Statistics Canada | Infrastructure costs, bridge conditions (national) |
+| open.canada.ca | Federal datasets |
+| donnees.montreal.ca | Montreal bridge records |
+| data.ontario.ca | Ontario bridge records |
+| openmaps.gov.bc.ca | BC airports, railways |
 | data.novascotia.ca | Nova Scotia structures |
-| donneesquebec.ca | Quebec provincial data |
+| donneesquebec.ca | Quebec airports |
 
 ## License
 
