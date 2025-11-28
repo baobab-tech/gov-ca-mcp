@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "gov-ca-dataset": {
+      "command": "/Users/krunal/Desktop/gov_mcp/.venv/bin/python",
+      "args": ["-m", "gov_mcp.server"],
+      "cwd": "/Users/krunal/Desktop/gov_mcp"
+    },
+    "gov-ca-transportation": {
+      "command": "/Users/krunal/Desktop/gov_mcp/.venv/bin/python",
+      "args": ["-m", "gov_ca_transportation.server"],
+      "cwd": "/Users/krunal/Desktop/gov_mcp"
+    }
+  }
+}
