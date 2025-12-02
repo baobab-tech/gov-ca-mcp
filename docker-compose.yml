@@ -1,0 +1,45 @@
+# Docker Compose for GOV CA MCP Servers
+# Run all servers: docker-compose up
+# Run specific server: docker-compose up gov-ca-dataset
+# Run in background: docker-compose up -d
+
+services:
+  # GOV CA Dataset Discovery MCP Server
+  gov-ca-dataset:
+    build:
+      context: .
+      dockerfile: gov_mcp/Dockerfile
+    container_name: gov-ca-dataset-mcp
+    ports:
+      - "8002:8002"
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/sse"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # GOV CA Transportation Infrastructure MCP Server
+  gov-ca-transportation:
+    build:
+      context: .
+      dockerfile: gov_ca_transportation/Dockerfile
+    container_name: gov-ca-transportation-mcp
+    ports:
+      - "8001:8001"
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/sse"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  default:
+    name: gov-ca-mcp-network

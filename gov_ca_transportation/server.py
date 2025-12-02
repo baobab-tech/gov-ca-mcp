@@ -1,10 +1,26 @@
 """
 GOV CA TRANSPORTATION INFRASTRUCTURE MCP Server
 Specialized MCP for Canadian transportation infrastructure data including
-bridges, tunnels, transit, cycling, roads, ports, airports, and railways.
+bridges, tunnels, ports, airports, and railways.
+
+Supports both stdio and SSE transports:
+- stdio: python -m gov_ca_transportation.server
+- SSE:   python -m gov_ca_transportation.server --sse --port 8001
 """
+import argparse
 import logging
 from typing import Any
+
+# Parse args early to set port before FastMCP initialization
+def _parse_args():
+    parser = argparse.ArgumentParser(description="GOV CA Transportation MCP Server")
+    parser.add_argument("--sse", action="store_true", help="Run with SSE transport (HTTP)")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8001, help="Port to listen on (default: 8001)")
+    args, _ = parser.parse_known_args()
+    return args
+
+_args = _parse_args()
 
 from mcp.server.fastmcp import FastMCP
 
@@ -18,10 +34,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create the MCP server using FastMCP
+# Create the MCP server using FastMCP with SSE config
 mcp = FastMCP(
     "gov_ca_transportation",
-    instructions="GOV CA TRANSPORTATION INFRASTRUCTURE MCP - Specialized MCP for Canadian transportation infrastructure including bridges, tunnels, transit, cycling, roads, ports, airports, and railways."
+    instructions="GOV CA TRANSPORTATION INFRASTRUCTURE MCP - Specialized MCP for Canadian transportation infrastructure including bridges, tunnels, ports, airports, and railways.",
+    host=_args.host,
+    port=_args.port,
 )
 
 # Initialize API client
@@ -63,6 +81,45 @@ def query_bridges(
         return result
     except Exception as e:
         logger.error(f"Error in query_bridges: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def query_road_conditions(
+    province: str | None = None,
+    highway: str | None = None,
+    condition: str | None = None,
+    pci_min: float | None = None,
+    pci_max: float | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """
+    Query road/pavement condition data across Canada.
+    
+    Args:
+        province: Filter by province (e.g., 'Ontario'). Currently Ontario has detailed data.
+        highway: Filter by highway number/name (e.g., '401', '17', '11')
+        condition: Filter by condition rating (good, fair, poor, critical)
+        pci_min: Minimum Pavement Condition Index (0-100)
+        pci_max: Maximum Pavement Condition Index (0-100)
+        limit: Maximum records to return (default 100)
+    
+    Returns:
+        Road condition records with PCI, DMI, IRI metrics and location data.
+        PCI thresholds: >=80 good, 60-79 fair, 40-59 poor, <40 critical
+    """
+    try:
+        result = api_client.query_road_conditions(
+            province=province,
+            highway=highway,
+            condition=condition,
+            pci_min=pci_min,
+            pci_max=pci_max,
+            limit=limit,
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Error in query_road_conditions: {e}", exc_info=True)
         return {"error": str(e)}
 
 
@@ -267,8 +324,28 @@ def compare_across_regions(
 
 def main():
     """Entry point for the Transportation MCP server."""
-    logger.info("Starting GOV CA TRANSPORTATION INFRASTRUCTURE MCP Server...")
-    mcp.run()
+    if _args.sse:
+        import uvicorn
+        from starlette.middleware.cors import CORSMiddleware
+        
+        logger.info(f"Starting GOV CA TRANSPORTATION MCP Server with SSE on http://{_args.host}:{_args.port}")
+        logger.info(f"SSE endpoint: http://{_args.host}:{_args.port}/sse")
+        
+        # Get the SSE app and add CORS middleware
+        app = mcp.sse_app()
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        # Run with uvicorn directly
+        uvicorn.run(app, host=_args.host, port=_args.port)
+    else:
+        logger.info("Starting GOV CA TRANSPORTATION MCP Server with stdio transport...")
+        mcp.run()
 
 
 if __name__ == "__main__":

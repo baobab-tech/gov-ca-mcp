@@ -1,10 +1,29 @@
 """
 Main MCP server implementation for Canada's Open Government infrastructure.
 Provides universal dataset search, metadata, and routing to specialized MCPs.
+
+Supports both stdio and SSE transports:
+- stdio: python -m gov_mcp.server
+- SSE:   python -m gov_mcp.server --sse --port 8002
 """
+import argparse
 import json
 import logging
+import os
+import sys
 from typing import Any
+
+# Parse args early to set port before FastMCP initialization
+def _parse_args():
+    parser = argparse.ArgumentParser(description="GOV CA Dataset MCP Server")
+    parser.add_argument("--sse", action="store_true", help="Run with SSE transport (HTTP)")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8002, help="Port to listen on (default: 8002)")
+    # Only parse known args to avoid issues with other flags
+    args, _ = parser.parse_known_args()
+    return args
+
+_args = _parse_args()
 
 from mcp.server.fastmcp import FastMCP
 
@@ -18,10 +37,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create the MCP server using FastMCP
+# Create the MCP server using FastMCP with SSE config if needed
 mcp = FastMCP(
     "gov-ca-dataset",
-    instructions="GOV CA DATASET - Government of Canada Open Data MCP Server for searching and querying Canadian government datasets"
+    instructions="GOV CA DATASET - Government of Canada Open Data MCP Server for searching and querying Canadian government datasets",
+    host=_args.host,
+    port=_args.port,
 )
 
 # Initialize API client
@@ -248,23 +269,30 @@ def query_datastore(
         return {"error": str(e)}
 
 
-# Wrapper class for compatibility
-class GovernmentMCPServer:
-    """Wrapper class for the FastMCP server."""
-    
-    def __init__(self):
-        self.server = mcp
-        self.api_client = api_client
-    
-    def run(self):
-        """Run the server."""
-        mcp.run()
-
-
 def main():
     """Entry point for the MCP server."""
-    logger.info("Starting Government MCP Server...")
-    mcp.run()
+    if _args.sse:
+        import uvicorn
+        from starlette.middleware.cors import CORSMiddleware
+        
+        logger.info(f"Starting GOV CA DATASET MCP Server with SSE on http://{_args.host}:{_args.port}")
+        logger.info(f"SSE endpoint: http://{_args.host}:{_args.port}/sse")
+        
+        # Get the SSE app and add CORS middleware
+        app = mcp.sse_app()
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        # Run with uvicorn directly
+        uvicorn.run(app, host=_args.host, port=_args.port)
+    else:
+        logger.info("Starting GOV CA DATASET MCP Server with stdio transport...")
+        mcp.run()
 
 
 if __name__ == "__main__":

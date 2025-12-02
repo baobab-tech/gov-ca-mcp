@@ -44,6 +44,104 @@ python -m gov_mcp.server
 python -m gov_ca_transportation.server
 ```
 
+### Docker Deployment
+
+Both MCP servers can be run as Docker containers individually or together using Docker Compose.
+
+#### Using Docker Compose (Recommended)
+
+```bash
+# Start all servers
+docker-compose up
+
+# Start in background (detached mode)
+docker-compose up -d
+
+# Start a specific server
+docker-compose up gov-ca-dataset
+docker-compose up gov-ca-transportation
+
+# View logs
+docker-compose logs -f
+
+# Stop all servers
+docker-compose down
+```
+
+#### Building Individual Docker Images
+
+```bash
+# Build Dataset Discovery MCP
+docker build -f gov_mcp/Dockerfile -t gov-ca-dataset-mcp .
+
+# Build Transportation Infrastructure MCP
+docker build -f gov_ca_transportation/Dockerfile -t gov-ca-transportation-mcp .
+```
+
+#### Running Individual Containers
+
+```bash
+# Run Dataset Discovery MCP (port 8002)
+docker run -d --name gov-ca-dataset -p 8002:8002 gov-ca-dataset-mcp
+
+# Run Transportation Infrastructure MCP (port 8001)
+docker run -d --name gov-ca-transportation -p 8001:8001 gov-ca-transportation-mcp
+```
+
+#### Docker Endpoints
+
+| Server | Container Port | Host Port | SSE Endpoint |
+|--------|---------------|-----------|--------------|
+| Dataset Discovery | 8002 | 8002 | http://localhost:8002/sse |
+| Transportation | 8001 | 8001 | http://localhost:8001/sse |
+
+### SSE (Server-Sent Events) Transport
+
+Both MCP servers support an SSE transport for HTTP-based streaming. Start either server with the `--sse` flag and a port argument to enable the SSE endpoint:
+
+```bash
+# Start Transportation MCP with SSE on port 8001
+python -m gov_ca_transportation.server --sse --port 8001
+
+# Start Dataset Discovery MCP with SSE on port 8002
+python -m gov_mcp.server --sse --port 8002
+```
+
+When SSE is enabled, the server logs the SSE endpoint (e.g., `http://0.0.0.0:8001/sse`). You can connect to that endpoint using a web client, curl, or a Python SSE client.
+
+Example connections:
+
+- Curl (raw stream):
+
+```bash
+curl -H "Accept: text/event-stream" -N http://localhost:8001/sse
+```
+
+- JavaScript (EventSource):
+
+```js
+const es = new EventSource("http://localhost:8001/sse");
+es.onmessage = (e) => console.log("SSE message:", e.data);
+es.onerror = (err) => console.error("SSE error:", err);
+```
+
+- Python (httpx-sse):
+
+```python
+from httpx_sse import EventSource
+
+with EventSource("http://localhost:8001/sse") as event_source:
+  for event in event_source:
+    # event is an object with .event, .data, .id
+    print(event.data)
+```
+
+Notes:
+- The SSE endpoint serves MCP events and results over HTTP for compatible clients.
+- The MCP server will print the SSE endpoint URL and port when started with `--sse`.
+- SSE-based transports require client support for Server-Sent Events (EventSource), or using Python/HTTP libraries with SSE support like `httpx-sse`.
+
+
 ## Architecture
 
 ```
@@ -137,15 +235,19 @@ gov_mcp/
 │   ├── server.py               # MCP server
 │   ├── api_client.py           # API wrapper
 │   ├── http_client.py          # HTTP client
-│   └── types.py                # Type definitions
+│   ├── types.py                # Type definitions
+│   └── Dockerfile              # Docker build for this server
 ├── gov_ca_transportation/      # Transportation MCP
 │   ├── __init__.py
 │   ├── server.py               # MCP server
 │   ├── api_client.py           # StatCan + provincial data fetcher
 │   ├── http_client.py          # HTTP client
-│   └── types.py                # Type definitions
+│   ├── types.py                # Type definitions
+│   └── Dockerfile              # Docker build for this server
 ├── tests/                      # Test files
 ├── documentation/              # Additional docs
+├── docker-compose.yml          # Docker Compose for all servers
+├── .dockerignore               # Docker ignore file
 ├── pyproject.toml              # Project config
 ├── requirements.txt            # Dependencies
 └── README.md                   # This file

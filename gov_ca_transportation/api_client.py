@@ -64,6 +64,30 @@ class TransportationAPIClient:
                 "format": "geojson",
             },
         },
+        "roads": {
+            "ontario": {
+                "province": "Ontario",
+                "city": None,
+                "csv_url": "https://files.ontario.ca/opendata/mto_pavement_condition_indices_2014.csv",
+                "name": "Ontario Pavement Condition Indices",
+                "format": "csv",
+                "columns": {
+                    "highway": "Highway",
+                    "direction": "DIR",
+                    "pci": "PCI",  # Pavement Condition Index
+                    "dmi": "DMI",  # Distress Manifestation Index
+                    "iri": "IRI",  # International Roughness Index
+                    "pave_type": "Pave_Type",
+                    "latitude": "Latitude",
+                    "longitude": "Longitude",
+                    "from_km": "FROM_Distance",
+                    "to_km": "TO_Distance",
+                    "section_from": "Pavement_Section_From",
+                    "section_to": "Pavement_Section_To",
+                    "func_class": "FUNC_CLASS",
+                },
+            },
+        },
     }
 
     def __init__(self, retry_config: Optional[RetryConfig] = None):
@@ -687,6 +711,218 @@ class TransportationAPIClient:
                 return "critical"
         except (ValueError, TypeError):
             return "unknown"
+
+    def query_road_conditions(
+        self,
+        province: Optional[str] = None,
+        highway: Optional[str] = None,
+        condition: Optional[str] = None,
+        pci_min: Optional[float] = None,
+        pci_max: Optional[float] = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """
+        Query road/pavement condition data across Canada.
+        
+        Args:
+            province: Filter by province (e.g., 'Ontario'). Currently Ontario has detailed data.
+            highway: Filter by highway number/name (e.g., '401', '17')
+            condition: Filter by condition rating (good, fair, poor, critical)
+            pci_min: Minimum Pavement Condition Index (0-100)
+            pci_max: Maximum Pavement Condition Index (0-100)
+            limit: Maximum records to return (default 100)
+        
+        Returns:
+            Road condition records with PCI, DMI, IRI metrics and location data
+        """
+        province_normalized = self.PROVINCE_NAMES.get(province.lower(), province) if province else None
+        
+        result = {
+            "province": province_normalized,
+            "roads": [],
+            "condition_summary": {
+                "good": 0,      # PCI >= 80
+                "fair": 0,      # PCI 60-79
+                "poor": 0,      # PCI 40-59
+                "critical": 0,  # PCI < 40
+            },
+            "sources": [],
+            "filters_applied": {
+                "province": province,
+                "highway": highway,
+                "condition": condition,
+                "pci_min": pci_min,
+                "pci_max": pci_max,
+            },
+        }
+        
+        # Map condition string to PCI range
+        condition_to_pci = {
+            "good": (80, 100),
+            "fair": (60, 79.99),
+            "poor": (40, 59.99),
+            "critical": (0, 39.99),
+        }
+        
+        if condition and condition.lower() in condition_to_pci:
+            range_min, range_max = condition_to_pci[condition.lower()]
+            if pci_min is None or pci_min < range_min:
+                pci_min = range_min
+            if pci_max is None or pci_max > range_max:
+                pci_max = range_max
+        
+        # Query available province data
+        query_ontario = (
+            province is None or 
+            province_normalized == "Ontario" or
+            (province and province.lower() in ["ontario", "on"])
+        )
+        
+        if query_ontario:
+            try:
+                ontario_roads = self._fetch_ontario_road_conditions(
+                    highway=highway,
+                    pci_min=pci_min,
+                    pci_max=pci_max,
+                    limit=limit,
+                )
+                result["roads"].extend(ontario_roads.get("roads", []))
+                result["sources"].append(ontario_roads.get("source", "Ontario Pavement Condition Data"))
+                
+                # Update condition summary
+                for road in ontario_roads.get("roads", []):
+                    cond = road.get("condition", "").lower()
+                    if cond in result["condition_summary"]:
+                        result["condition_summary"][cond] += 1
+            except Exception as e:
+                logger.error(f"Error fetching Ontario road data: {e}")
+        
+        result["count"] = len(result["roads"])
+        
+        if not result["roads"]:
+            result["note"] = (
+                "Detailed road condition data currently available for: Ontario. "
+                "Other provinces coming soon. Use get_infrastructure_costs for aggregate road statistics."
+            )
+        
+        return result
+
+    def _fetch_ontario_road_conditions(
+        self,
+        highway: Optional[str] = None,
+        pci_min: Optional[float] = None,
+        pci_max: Optional[float] = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """
+        Fetch Ontario pavement condition data from open data portal.
+        
+        Returns road sections with PCI (Pavement Condition Index),
+        DMI (Distress Manifestation Index), and IRI (International Roughness Index).
+        """
+        try:
+            resource = self.KNOWN_RESOURCES["roads"]["ontario"]
+            csv_data = self._fetch_csv(resource["csv_url"])
+            
+            roads = []
+            cols = resource["columns"]
+            
+            for row in csv_data:
+                # Parse PCI value
+                pci_str = row.get(cols["pci"], "")
+                try:
+                    pci = float(pci_str) if pci_str else None
+                except ValueError:
+                    pci = None
+                
+                # Skip if PCI filters don't match
+                if pci is not None:
+                    if pci_min is not None and pci < pci_min:
+                        continue
+                    if pci_max is not None and pci > pci_max:
+                        continue
+                
+                # Filter by highway if specified
+                row_highway = row.get(cols["highway"], "")
+                if highway:
+                    # Allow partial match (e.g., "401" matches "Highway 401")
+                    if str(highway).lower() not in str(row_highway).lower():
+                        continue
+                
+                # Parse other metrics
+                try:
+                    dmi = float(row.get(cols["dmi"], "")) if row.get(cols["dmi"]) else None
+                except ValueError:
+                    dmi = None
+                
+                try:
+                    iri = float(row.get(cols["iri"], "")) if row.get(cols["iri"]) else None
+                except ValueError:
+                    iri = None
+                
+                try:
+                    lat = float(row.get(cols["latitude"], "")) if row.get(cols["latitude"]) else None
+                    lon = float(row.get(cols["longitude"], "")) if row.get(cols["longitude"]) else None
+                except ValueError:
+                    lat, lon = None, None
+                
+                try:
+                    from_km = float(row.get(cols["from_km"], "")) if row.get(cols["from_km"]) else None
+                    to_km = float(row.get(cols["to_km"], "")) if row.get(cols["to_km"]) else None
+                except ValueError:
+                    from_km, to_km = None, None
+                
+                road_record = {
+                    "highway": row_highway,
+                    "direction": row.get(cols["direction"], ""),
+                    "pci": pci,
+                    "condition": self._map_road_condition(pci),
+                    "dmi": dmi,
+                    "iri": iri,
+                    "pavement_type": row.get(cols["pave_type"], ""),
+                    "section_from": row.get(cols["section_from"], ""),
+                    "section_to": row.get(cols["section_to"], ""),
+                    "from_km": from_km,
+                    "to_km": to_km,
+                    "functional_class": row.get(cols["func_class"], ""),
+                    "province": "Ontario",
+                }
+                
+                if lat and lon:
+                    road_record["latitude"] = lat
+                    road_record["longitude"] = lon
+                    road_record["geometry"] = {
+                        "type": "Point",
+                        "coordinates": [lon, lat]
+                    }
+                
+                roads.append(road_record)
+                
+                if len(roads) >= limit:
+                    break
+            
+            return {
+                "roads": roads,
+                "source": resource["name"],
+                "count": len(roads),
+            }
+            
+        except Exception as e:
+            logger.error(f"Error fetching Ontario road conditions: {e}")
+            return {"roads": [], "source": "Ontario Pavement Condition Data", "error": str(e)}
+
+    def _map_road_condition(self, pci: Optional[float]) -> str:
+        """Map Pavement Condition Index to condition rating."""
+        if pci is None:
+            return "unknown"
+        if pci >= 80:
+            return "good"
+        elif pci >= 60:
+            return "fair"
+        elif pci >= 40:
+            return "poor"
+        else:
+            return "critical"
 
     def query_tunnels(
         self,

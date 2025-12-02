@@ -7,10 +7,10 @@ __author__ = "Government MCP Team"
 __description__ = "Model Context Protocol server for Canada's Open Government infrastructure data"
 
 from gov_mcp.api_client import OpenGovCanadaClient
-from gov_mcp.server import GovernmentMCPServer, main
+from gov_mcp.server import main, mcp
 
 __all__ = [
     "OpenGovCanadaClient",
-    "GovernmentMCPServer",
+    "mcp",
     "main",
 ]
