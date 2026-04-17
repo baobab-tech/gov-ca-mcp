@@ -272,23 +272,41 @@ def query_datastore(
 def main():
     """Entry point for the MCP server."""
     if _args.sse:
+        import contextlib
         import uvicorn
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
         from starlette.middleware.cors import CORSMiddleware
-        
-        logger.info(f"Starting GOV CA DATASET MCP Server with SSE on http://{_args.host}:{_args.port}")
-        logger.info(f"SSE endpoint: http://{_args.host}:{_args.port}/sse")
-        
-        # Get the SSE app and add CORS middleware
-        app = mcp.sse_app()
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
+
+        logger.info(f"Starting GOV CA DATASET MCP Server on http://{_args.host}:{_args.port}")
+        logger.info(f"Streamable HTTP endpoint: http://{_args.host}:{_args.port}/mcp")
+        logger.info(f"Legacy SSE endpoint:      http://{_args.host}:{_args.port}/sse")
+
+        sse_app = mcp.sse_app()
+        http_app = mcp.streamable_http_app()
+
+        @contextlib.asynccontextmanager
+        async def lifespan(app):
+            async with contextlib.AsyncExitStack() as stack:
+                await stack.enter_async_context(sse_app.router.lifespan_context(app))
+                await stack.enter_async_context(http_app.router.lifespan_context(app))
+                yield
+
+        app = Starlette(
+            routes=sse_app.routes + http_app.routes,
+            lifespan=lifespan,
+            middleware=[
+                Middleware(
+                    CORSMiddleware,
+                    allow_origins=["*"],
+                    allow_credentials=True,
+                    allow_methods=["*"],
+                    allow_headers=["*"],
+                    expose_headers=["mcp-session-id"],
+                )
+            ],
         )
-        
-        # Run with uvicorn directly
+
         uvicorn.run(app, host=_args.host, port=_args.port)
     else:
         logger.info("Starting GOV CA DATASET MCP Server with stdio transport...")
