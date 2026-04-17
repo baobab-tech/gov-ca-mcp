@@ -95,19 +95,30 @@ docker run -d --name gov-ca-transportation -p 8001:8001 gov-ca-transportation-mc
 | Dataset Discovery | 8002 | 8002 | http://localhost:8002/sse |
 | Transportation | 8001 | 8001 | http://localhost:8001/sse |
 
-### SSE (Server-Sent Events) Transport
+### HTTP Transports (Streamable HTTP + SSE)
 
-Both MCP servers support an SSE transport for HTTP-based streaming. Start either server with the `--sse` flag and a port argument to enable the SSE endpoint:
+Both MCP servers can run over HTTP. Starting with the `--sse` flag enables **two** transports on the same port:
+
+- **Streamable HTTP** at `/mcp` — the current MCP spec, used by Claude.ai web custom connectors
+- **Legacy SSE** at `/sse` (+ `/messages`) — used by older MCP clients and examples
 
 ```bash
-# Start Transportation MCP with SSE on port 8001
+# Start Transportation MCP on port 8001 (exposes /mcp and /sse)
 python -m gov_ca_transportation.server --sse --port 8001
 
-# Start Dataset Discovery MCP with SSE on port 8002
+# Start Dataset Discovery MCP on port 8002 (exposes /mcp and /sse)
 python -m gov_mcp.server --sse --port 8002
 ```
 
-When SSE is enabled, the server logs the SSE endpoint (e.g., `http://0.0.0.0:8001/sse`). You can connect to that endpoint using a web client, curl, or a Python SSE client.
+The server logs both endpoint URLs on startup. Pick the one your client expects:
+
+| Client | Endpoint to use |
+|--------|----------------|
+| Claude.ai web (custom connector) | `https://host/mcp` |
+| Claude Code (`--transport sse`)  | `https://host/sse` |
+| Claude Desktop (`type: "sse"`)   | `https://host/sse` |
+| Any Streamable HTTP client       | `https://host/mcp` |
+| Any legacy SSE client            | `https://host/sse` |
 
 Example connections:
 
