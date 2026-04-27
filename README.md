@@ -97,27 +97,27 @@ docker run -d --name gov-ca-transportation -p 8001:8001 gov-ca-transportation-mc
 
 ### HTTP Transports (Streamable HTTP + SSE)
 
-Both MCP servers can run over HTTP. Starting with the `--sse` flag enables **two** transports on the same port:
+Both MCP servers can run over HTTP with the `--sse` flag, but **Streamable HTTP is currently available only for the Dataset Discovery server**. Today:
 
-- **Streamable HTTP** at `/mcp` — the current MCP spec, used by Claude.ai web custom connectors
-- **Legacy SSE** at `/sse` (+ `/messages`) — used by older MCP clients and examples
+- **Dataset Discovery (`gov_mcp`)** exposes **Streamable HTTP** at `/mcp` and **legacy SSE** at `/sse` (+ `/messages`)
+- **Transportation (`gov_ca_transportation`)** exposes **legacy SSE** at `/sse` (+ `/messages`) for now
 
 ```bash
-# Start Transportation MCP on port 8001 (exposes /mcp and /sse)
+# Start Transportation MCP on port 8001 (exposes /sse)
 python -m gov_ca_transportation.server --sse --port 8001
 
 # Start Dataset Discovery MCP on port 8002 (exposes /mcp and /sse)
 python -m gov_mcp.server --sse --port 8002
 ```
 
-The server logs both endpoint URLs on startup. Pick the one your client expects:
+The server logs its available endpoint URLs on startup. Pick the one your client expects:
 
 | Client | Endpoint to use |
 |--------|----------------|
-| Claude.ai web (custom connector) | `https://host/mcp` |
+| Claude.ai web (custom connector) | Dataset Discovery: `https://host/mcp` |
 | Claude Code (`--transport sse`)  | `https://host/sse` |
 | Claude Desktop (`type: "sse"`)   | `https://host/sse` |
-| Any Streamable HTTP client       | `https://host/mcp` |
+| Any Streamable HTTP client       | Dataset Discovery: `https://host/mcp` |
 | Any legacy SSE client            | `https://host/sse` |
 
 Example connections:
